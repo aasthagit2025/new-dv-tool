@@ -11,229 +11,115 @@ rules_file = st.file_uploader("Upload validation rules (Excel)", type=["xlsx"])
 
 if data_file and rules_file:
     # --- Load Data ---
-    name = data_file.name.lower()
-    if name.endswith(".csv"):
+    if data_file.name.endswith(".csv"):
         df = pd.read_csv(data_file)
-    elif name.endswith(".xlsx") or name.endswith(".xls"):
+    elif data_file.name.endswith(".xlsx"):
         df = pd.read_excel(data_file)
-    elif name.endswith(".sav"):
+    elif data_file.name.endswith(".sav"):
         df, meta = pyreadstat.read_sav(data_file)
     else:
         st.error("Unsupported file type")
         st.stop()
 
-    # Ensure RespondentID exists so we can report respondent-level issues
-    if "RespondentID" not in df.columns:
-        df.insert(0, "RespondentID", range(1, len(df) + 1))
-
     # --- Load Rules ---
     rules_df = pd.read_excel(rules_file)
 
-    # --- Validation Report Logic (per-respondent detail) ---
-    rows = []  # will hold dicts with RespondentID, Question, Check_Type, Issue, Value
-
+    # --- Validation Report Logic ---
+    report = []
     for _, rule in rules_df.iterrows():
         q = rule["Question"]
         check_type = rule["Check_Type"]
-        condition = str(rule.get("Condition", "")).strip()
+        condition = rule["Condition"]
 
-        # If question not present in dataset -> dataset-level note
+        if check_type == "Straightliner":
+            # ✅ Handle multiple columns separated by commas
+            related_cols = [col.strip() for col in q.split(",")]
+            related_cols = [col for col in related_cols if col in df.columns]
+
+            if len(related_cols) > 1:
+                straightliners = df[related_cols].nunique(axis=1)
+                offenders = df.loc[straightliners == 1, "RespondentID"]
+                for rid in offenders:
+                    report.append({
+                        "RespondentID": rid,
+                        "Question": ",".join(related_cols),
+                        "Check_Type": "Straightliner",
+                        "Issue": "Same response across all items"
+                    })
+            else:
+                report.append({
+                    "RespondentID": None,
+                    "Question": q,
+                    "Check_Type": "Straightliner",
+                    "Issue": "Question(s) not found in dataset"
+                })
+            continue  # Skip normal "Question not found" check for Straightliner
+
+        # --- Normal Single-Column Checks ---
         if q not in df.columns:
-            rows.append({
-                "RespondentID": "",
-                "Question": q,
-                "Check_Type": check_type,
-                "Issue": "Question not found in dataset",
-                "Value": ""
-            })
+            report.append({"RespondentID": None, "Question": q, "Check_Type": check_type, "Issue": "Question not found in dataset"})
             continue
 
-        # --- Missing: list each respondent with missing value ---
         if check_type == "Missing":
-            mask = df[q].isna()
-            for idx in df[mask].index:
-                rows.append({
-                    "RespondentID": df.at[idx, "RespondentID"],
-                    "Question": q,
-                    "Check_Type": "Missing",
-                    "Issue": "Value is missing",
-                    "Value": df.at[idx, q]
-                })
+            missing = df[q].isna().sum()
+            if missing > 0:
+                offenders = df.loc[df[q].isna(), "RespondentID"]
+                for rid in offenders:
+                    report.append({"RespondentID": rid, "Question": q, "Check_Type": "Missing", "Issue": "Value is missing"})
 
-        # --- Range: list each respondent out of range or non-numeric ---
         elif check_type == "Range":
             try:
-                parts = [p.strip() for p in condition.split("-")]
-                min_val = float(parts[0])
-                max_val = float(parts[1])
-            except Exception:
-                # If range parse fails, add a dataset-level error
-                rows.append({
-                    "RespondentID": "",
-                    "Question": q,
-                    "Check_Type": "Range",
-                    "Issue": f"Invalid range condition '{condition}'",
-                    "Value": ""
-                })
-                continue
+                min_val, max_val = map(float, condition.split("-"))
+                offenders = df.loc[~df[q].between(min_val, max_val), "RespondentID"]
+                for rid in offenders:
+                    report.append({"RespondentID": rid, "Question": q, "Check_Type": "Range", "Issue": f"Value out of range ({min_val}-{max_val})"})
+            except:
+                report.append({"RespondentID": None, "Question": q, "Check_Type": "Range", "Issue": "Invalid range condition"})
 
-            # numeric coercion to catch non-numeric values
-            numeric_series = pd.to_numeric(df[q], errors="coerce")
-            non_numeric_mask = df[q].notna() & numeric_series.isna()
-            for idx in df[non_numeric_mask].index:
-                rows.append({
-                    "RespondentID": df.at[idx, "RespondentID"],
-                    "Question": q,
-                    "Check_Type": "Range",
-                    "Issue": "Non-numeric value",
-                    "Value": df.at[idx, q]
-                })
-            out_of_range_mask = numeric_series.notna() & ~numeric_series.between(min_val, max_val)
-            for idx in df[out_of_range_mask].index:
-                rows.append({
-                    "RespondentID": df.at[idx, "RespondentID"],
-                    "Question": q,
-                    "Check_Type": "Range",
-                    "Issue": f"Value out of range ({min_val}-{max_val})",
-                    "Value": df.at[idx, q]
-                })
-
-        # --- Skip: Example format "If Q1=2 then Q3 should be empty" ---
         elif check_type == "Skip":
             try:
-                # split by 'then' to handle formats like "If Q1=2 then Q3 should be empty"
                 cond_parts = condition.split("then")
-                if_part = cond_parts[0].strip()
-                then_part = cond_parts[1].strip()
+                if_part, then_part = cond_parts[0].strip(), cond_parts[1].strip()
                 if_q, if_val = if_part.replace("If", "").strip().split("=")
                 then_q = then_part.split()[0]
-                if_q = if_q.strip()
-                if_val = if_val.strip()
+                subset = df[df[if_q.strip()] == int(if_val.strip())]
+                offenders = subset.loc[subset[then_q].notna(), "RespondentID"]
+                for rid in offenders:
+                    report.append({"RespondentID": rid, "Question": q, "Check_Type": "Skip", "Issue": "Answered but should be blank"})
+            except:
+                report.append({"RespondentID": None, "Question": q, "Check_Type": "Skip", "Issue": "Invalid skip rule format"})
 
-                # subset where condition holds
-                subset_mask = df[if_q] == pd.to_numeric(if_val, errors="coerce")
-                # respondents who violated skip (i.e., then_q is NOT blank)
-                violate_mask = subset_mask & df[then_q].notna() & (df[then_q].astype(str).str.strip() != "")
-                for idx in df[violate_mask].index:
-                    rows.append({
-                        "RespondentID": df.at[idx, "RespondentID"],
-                        "Question": then_q,
-                        "Check_Type": "Skip",
-                        "Issue": f"Answered but should be blank when {if_q}={if_val}",
-                        "Value": df.at[idx, then_q]
-                    })
-            except Exception:
-                rows.append({
-                    "RespondentID": "",
-                    "Question": q,
-                    "Check_Type": "Skip",
-                    "Issue": "Invalid skip rule format",
-                    "Value": condition
-                })
-
-        # --- Multi-Select: related columns start with q (prefix) ---
         elif check_type == "Multi-Select":
             related_cols = [col for col in df.columns if col.startswith(q)]
-            # invalid values (not 0/1)
             for col in related_cols:
-                mask_invalid = df[col].notna() & (~df[col].isin([0, 1]))
-                for idx in df[mask_invalid].index:
-                    rows.append({
-                        "RespondentID": df.at[idx, "RespondentID"],
-                        "Question": col,
-                        "Check_Type": "Multi-Select",
-                        "Issue": "Invalid value (not 0/1)",
-                        "Value": df.at[idx, col]
-                    })
-            # none selected: sum across related cols == 0 (treat NaN as 0)
-            if related_cols:
-                sums = df[related_cols].fillna(0).sum(axis=1)
-                mask_none = sums == 0
-                for idx in df[mask_none].index:
-                    rows.append({
-                        "RespondentID": df.at[idx, "RespondentID"],
-                        "Question": q,
-                        "Check_Type": "Multi-Select",
-                        "Issue": "No options selected in multiselect group",
-                        "Value": ", ".join([str(df.at[idx, c]) for c in related_cols])
-                    })
+                offenders = df.loc[~df[col].isin([0, 1]), "RespondentID"]
+                for rid in offenders:
+                    report.append({"RespondentID": rid, "Question": col, "Check_Type": "Multi-Select", "Issue": "Invalid value (not 0/1)"})
+            if len(related_cols) > 0:
+                offenders = df.loc[df[related_cols].sum(axis=1) == 0, "RespondentID"]
+                for rid in offenders:
+                    report.append({"RespondentID": rid, "Question": q, "Check_Type": "Multi-Select", "Issue": "No options selected"})
 
-       elif check_type == "Straightliner":
-    # Support multiple columns listed as comma-separated in rules
-    related_cols = [col.strip() for col in q.split(",")]
-
-    # Only keep the columns that actually exist in the dataset
-    related_cols = [col for col in related_cols if col in df.columns]
-
-    if len(related_cols) > 1:
-        straightliners = df[related_cols].nunique(axis=1)
-        offenders = df.loc[straightliners == 1, "RespondentID"]
-        for rid in offenders:
-            report.append({
-                "RespondentID": rid,
-                "Question": ",".join(related_cols),
-                "Check_Type": "Straightliner",
-                "Issue": "Same response across all items"
-            })
-    else:
-        report.append({
-            "RespondentID": None,
-            "Question": q,
-            "Check_Type": "Straightliner",
-            "Issue": "Question(s) not found in dataset"
-        })
-
-        # --- OpenEnd_Junk: short / gibberish (simple heuristic) ---
         elif check_type == "OpenEnd_Junk":
-            # treat strings of length <3 or common junk markers as junk
-            s = df[q].astype(str).fillna("")
-            mask_short = s.str.len() < 3
-            mask_lorem = s.str.lower().str.contains("lorem", na=False)
-            mask_asd = s.str.lower().str.contains("asd|qwer|asdf", na=False)
-            mask = (mask_short | mask_lorem | mask_asd) & (s != "nan")
-            for idx in df[mask].index:
-                rows.append({
-                    "RespondentID": df.at[idx, "RespondentID"],
-                    "Question": q,
-                    "Check_Type": "OpenEnd_Junk",
-                    "Issue": "Open-end looks like junk/low-effort",
-                    "Value": df.at[idx, q]
-                })
+            junk = df[q].astype(str).str.len() < 3
+            offenders = df.loc[junk, "RespondentID"]
+            for rid in offenders:
+                report.append({"RespondentID": rid, "Question": q, "Check_Type": "OpenEnd_Junk", "Issue": "Open-end looks like junk/low-effort"})
 
-        # --- Duplicate: report each respondent who is duplicated on this variable ---
         elif check_type == "Duplicate":
-            if q in df.columns:
-                dup_df = df[df.duplicated(subset=[q], keep=False)]
-                for idx in dup_df.index:
-                    rows.append({
-                        "RespondentID": df.at[idx, "RespondentID"],
-                        "Question": q,
-                        "Check_Type": "Duplicate",
-                        "Issue": f"Duplicate value ({df.at[idx, q]})",
-                        "Value": df.at[idx, q]
-                    })
+            duplicate_ids = df[df.duplicated(subset=[q], keep=False)]["RespondentID"]
+            for rid in duplicate_ids:
+                report.append({"RespondentID": rid, "Question": q, "Check_Type": "Duplicate", "Issue": "Duplicate value found"})
 
-        else:
-            # unknown check type -> note it at dataset level
-            rows.append({
-                "RespondentID": "",
-                "Question": q,
-                "Check_Type": check_type,
-                "Issue": "Unknown check type (no evaluation)",
-                "Value": condition
-            })
-
-    # Build report DataFrame
-    report_df = pd.DataFrame(rows, columns=["RespondentID", "Question", "Check_Type", "Issue", "Value"])
+    report_df = pd.DataFrame(report)
 
     st.write("### Validation Report (detailed by Respondent)")
     st.dataframe(report_df)
 
-    # --- Download using openpyxl (works on Streamlit Cloud) ---
+    # --- ✅ Download Report ---
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         report_df.to_excel(writer, index=False, sheet_name="Validation Report")
-    output.seek(0)
 
     st.download_button(
         label="Download Validation Report",
