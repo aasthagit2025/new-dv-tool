@@ -1,5 +1,7 @@
 import pandas as pd
 import streamlit as st
+import pyreadstat
+from io import BytesIO
 
 st.title("📊 Survey Data Validation Tool")
 
@@ -60,3 +62,4 @@ if data_file and rules_file:
         st.download_button("📥 Download Validation Report", results_df.to_csv(index=False), "DV_report.csv")
     else:
         st.success("🎉 No validation issues found!")
+
