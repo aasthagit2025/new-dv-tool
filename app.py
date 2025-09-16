@@ -1,65 +1,97 @@
-import pandas as pd
 import streamlit as st
+import pandas as pd
 import pyreadstat
-from io import BytesIO
+import re
 
-st.title("📊 Survey Data Validation Tool")
+st.set_page_config(page_title="Data Validation Tool", layout="wide")
+st.title("🛠 Data Validation Tool")
 
-# Upload survey data
-data_file = st.file_uploader("Upload survey data (CSV or SAV)", type=["csv", "sav"])
+# File Upload
+uploaded_file = st.file_uploader("Upload data file", type=["csv", "xlsx", "sav"])
 
-# Upload validation rules
-rules_file = st.file_uploader("Upload validation rules (Excel)", type=["xlsx"])
+# Load Data
+df = None
+if uploaded_file is not None:
+    if uploaded_file.name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    elif uploaded_file.name.endswith(".xlsx"):
+        df = pd.read_excel(uploaded_file)
+    elif uploaded_file.name.endswith(".sav"):
+        df, meta = pyreadstat.read_sav(uploaded_file)
 
-if data_file and rules_file:
-    # Load data
-    if data_file.name.endswith(".csv"):
-        data = pd.read_csv(data_file)
-    else:
-        try:
-            import pyreadstat
-            data, meta = pyreadstat.read_sav(data_file)
-        except ImportError:
-            st.error("Please install pyreadstat to read SPSS .sav files")
-            st.stop()
+    st.success(f"File loaded successfully with {df.shape[0]} rows and {df.shape[1]} columns")
+    st.dataframe(df.head())
 
-    st.write("✅ Data loaded successfully", data.shape)
+# Load Validation Rules
+rules_file = st.file_uploader("Upload Validation Rules (CSV)", type=["csv"])
+rules_df = None
+if rules_file is not None:
+    rules_df = pd.read_csv(rules_file)
+    st.write("### Rules Preview")
+    st.dataframe(rules_df.head())
 
-    # Load validation rules
-    rules = pd.read_excel(rules_file)
+# --- Validation Functions ---
+def check_missing(df, variable):
+    return df[variable].isna()
 
-    st.subheader("Validation Results")
-    validation_results = []
+def check_range(df, variable, min_val, max_val):
+    return ~df[variable].between(min_val, max_val, inclusive="both")
 
-    for _, rule in rules.iterrows():
-        q = rule["question"]
+def check_skip(df, variable, condition_var, condition_val):
+    return (df[condition_var] == condition_val) & (df[variable].isna())
 
-        if q not in data.columns:
-            validation_results.append(
-                {"question": q, "rule": rule["type"], "status": "⚠️ Question not in dataset"}
-            )
-            continue
+def check_multiselect(df, prefix):
+    multi_vars = [col for col in df.columns if col.startswith(prefix)]
+    invalid_values = df[multi_vars].applymap(lambda x: x not in [0,1]).any(axis=1)
+    all_zero = (df[multi_vars].sum(axis=1) == 0)
+    return invalid_values | all_zero
 
-        if rule["type"] == "missing":
-            invalid = data[data[q].isna()]
-            if not invalid.empty:
-                validation_results.append(
-                    {"question": q, "rule": "missing", "status": f"{len(invalid)} missing values"}
-                )
+def check_straightlining(df, grid_prefix):
+    grid_vars = [col for col in df.columns if col.startswith(grid_prefix)]
+    return df[grid_vars].nunique(axis=1) == 1
 
-        elif rule["type"] == "range":
-            min_val, max_val = rule["min"], rule["max"]
-            invalid = data[(data[q] < min_val) | (data[q] > max_val)]
-            if not invalid.empty:
-                validation_results.append(
-                    {"question": q, "rule": f"range {min_val}-{max_val}", "status": f"{len(invalid)} out of range"}
-                )
+def check_openend_junk(series):
+    junk_patterns = [
+        r"^[a-z]$", r"^[0-9]+$", r"^asdf$", r"^test$", r"(.)\1{3,}"
+    ]
+    return series.astype(str).apply(
+        lambda x: any(re.match(p, x.lower()) for p in junk_patterns)
+    )
 
-    if validation_results:
-        results_df = pd.DataFrame(validation_results)
-        st.dataframe(results_df)
-        results_df.to_csv("DV_report.csv", index=False)
-        st.download_button("📥 Download Validation Report", results_df.to_csv(index=False), "DV_report.csv")
-    else:
-        st.success("🎉 No validation issues found!")
+def check_ai_generated(series):
+    ai_like = ["as an ai", "i am unable", "thank you for asking", "in conclusion", "overall,"]
+    return series.astype(str).apply(
+        lambda x: any(phrase in x.lower() for phrase in ai_like) or len(x.split()) > 50
+    )
 
+# --- Run Checks ---
+if df is not None and rules_df is not None:
+    results = {}
+
+    for _, rule in rules_df.iterrows():
+        var = rule["Variable"]
+        rule_type = rule["RuleType"]
+
+        if rule_type == "MISSING":
+            results[var] = check_missing(df, var)
+        elif rule_type == "RANGE":
+            results[var] = check_range(df, var, rule["Min"], rule["Max"])
+        elif rule_type == "SKIP":
+            results[var] = check_skip(df, var, rule["ConditionVar"], rule["ConditionVal"])
+        elif rule_type == "MULTISELECT":
+            results[var] = check_multiselect(df, rule["Prefix"])
+        elif rule_type == "STRAIGHTLINE":
+            results[var] = check_straightlining(df, rule["Prefix"])
+        elif rule_type == "OE_JUNK":
+            results[var] = check_openend_junk(df[var])
+        elif rule_type == "OE_AI":
+            results[var] = check_ai_generated(df[var])
+
+    # Compile Results
+    error_df = pd.DataFrame(results)
+    st.write("### Validation Results")
+    st.dataframe(error_df)
+
+    # Download option
+    csv = error_df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download Validation Results", data=csv, file_name="validation_results.csv", mime="text/csv")
