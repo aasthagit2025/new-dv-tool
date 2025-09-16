@@ -100,8 +100,14 @@ if data_file and rules_file:
     st.write("### Validation Report")
     st.dataframe(report_df)
 
-    # --- Download Report ---
+    # --- ✅ Fixed Download Report Section ---
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         report_df.to_excel(writer, index=False, sheet_name="Validation Report")
-    st.download_button("Download Validation Report", output.getvalue(), "validation_report.xlsx")
+
+    st.download_button(
+        label="Download Validation Report",
+        data=output.getvalue(),
+        file_name="validation_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
