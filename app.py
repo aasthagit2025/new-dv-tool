@@ -1,104 +1,119 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
 import pyreadstat
-from collections import Counter
+import io
+import re
 
-st.title("Automated Data Validation Tool")
+st.title("📊 Survey Data Validation Tool")
 
-# Upload data file
-data_file = st.file_uploader("Upload survey data (CSV or SPSS)", type=["csv", "sav"])
-rules_file = st.file_uploader("Upload Validation Rules (Excel)", type=["xlsx"])
+# --- Upload data ---
+data_file = st.file_uploader("Upload survey data (CSV or SAV)", type=["csv", "sav"])
+rules_file = st.file_uploader("Upload validation rules (Excel)", type=["xlsx"])
 
 if data_file and rules_file:
-    # Read data
+    # --- Read data ---
     if data_file.name.endswith(".csv"):
-        data = pd.read_csv(data_file)
+        try:
+            data = pd.read_csv(data_file)
+        except Exception:
+            data = pd.read_csv(data_file, encoding="latin1", on_bad_lines="skip")
     else:
-        data, meta = pyreadstat.read_sav(data_file)
+        df, meta = pyreadstat.read_sav(data_file)
+        data = df.copy()
 
     # Ensure RespondentID exists
     if "RespondentID" not in data.columns:
-        st.error("Dataset must contain a 'RespondentID' column.")
-    else:
-        rules = pd.ExcelFile(rules_file)
-        results = []
+        data.insert(0, "RespondentID", range(1, len(data) + 1))
 
-        # Iterate through rules
-        for sheet in rules.sheet_names:
-            rule_df = pd.read_excel(rules, sheet_name=sheet)
+    # --- Read rules ---
+    rules = pd.read_excel(rules_file)
 
-            for _, rule in rule_df.iterrows():
-                var = str(rule["Variable"])
-                check = str(rule["CheckType"]).lower()
-                cond = str(rule.get("Condition", ""))
+    results = []
 
-                if var not in data.columns and check != "duplicate":
-                    continue
+    # --- Apply validation rules ---
+    for _, rule in rules.iterrows():
+        var = rule["Variable"]
+        check = rule["CheckType"].lower()
+        cond = str(rule["Condition"]).strip()
 
-                # ---- MISSING CHECK ----
-                if check == "missing":
-                    failed = data[data[var].isna()]
-                    for rid in failed["RespondentID"]:
-                        results.append([rid, var, "Missing", "Value is missing", "Fail"])
+        # Missing check
+        if check == "missing":
+            failed = data[data[var].isna()]
+            for rid in failed["RespondentID"]:
+                results.append([rid, var, "Missing", "Value is missing", "Fail"])
 
-                # ---- RANGE CHECK ----
-                elif check == "range":
-                    min_val, max_val = map(float, cond.split("-"))
-                    failed = data[(data[var] < min_val) | (data[var] > max_val)]
-                    for rid in failed["RespondentID"]:
-                        results.append([rid, var, "Range", f"Not in {cond}", "Fail"])
+        # Range check
+        elif check == "range":
+            if "-" in cond:
+                min_v, max_v = cond.split("-")
+                min_v, max_v = float(min_v), float(max_v)
+                failed = data[(data[var] < min_v) | (data[var] > max_v)]
+                for rid in failed["RespondentID"]:
+                    results.append([rid, var, "Range", f"Valid range {min_v}-{max_v}", "Fail"])
 
-                # ---- SKIP CHECK ----
-                elif check == "skip":
-                    dep_var, dep_val = cond.split("=")
-                    mask = data[dep_var] != int(dep_val)
-                    failed = data[mask & data[var].notna()]
-                    for rid in failed["RespondentID"]:
-                        results.append([rid, var, "Skip", f"Should be empty if {dep_var}!={dep_val}", "Fail"])
+        # Skip check
+        elif check == "skip":
+            if "=" in cond:
+                dep_var, dep_val = cond.split("=")
+                dep_val = dep_val.strip()
+                mask = (data[dep_var] == float(dep_val)) & (data[var].isna())
+                failed = data[mask]
+                for rid in failed["RespondentID"]:
+                    results.append([rid, var, "Skip", f"Should not skip when {dep_var}={dep_val}", "Fail"])
 
-                # ---- MULTI SELECT CHECK ----
-                elif check == "multi-select":
-                    subset = [c for c in data.columns if c.startswith(var)]
-                    for col in subset:
-                        invalid = data[~data[col].isin([0, 1])]
-                        for rid in invalid["RespondentID"]:
-                            results.append([rid, col, "Multi-Select", "Invalid value (not 0/1)", "Fail"])
-                    # check at least one =1
-                    for i, row in data.iterrows():
-                        if row[subset].sum() == 0:
-                            results.append([row["RespondentID"], ",".join(subset), "Multi-Select", "No option selected", "Fail"])
+        # Multi-select
+        elif check == "multi-select":
+            multi_vars = [c for c in data.columns if c.startswith("Multi_")]
+            for v in multi_vars:
+                failed = data[~data[v].isin([0, 1])]
+                for rid in failed["RespondentID"]:
+                    results.append([rid, v, "Multi-Select", "Only 0/1 allowed", "Fail"])
+            failed_sum = data[data[multi_vars].sum(axis=1) == 0]
+            for rid in failed_sum["RespondentID"]:
+                results.append([rid, ",".join(multi_vars), "Multi-Select", "At least one=1 required", "Fail"])
 
-                # ---- STRAIGHTLINER CHECK ----
-                elif check == "straightliner":
-                    subset = [c for c in data.columns if c.startswith(var)]
-                    for i, row in data.iterrows():
-                        if len(set(row[subset].dropna())) == 1 and len(row[subset].dropna()) > 1:
-                            results.append([row["RespondentID"], ",".join(subset), "Straightliner", "All responses same", "Fail"])
+        # Straightliners
+        elif check == "straightliner":
+            straight_vars = [c for c in data.columns if c.startswith(var)]
+            failed = data[straight_vars][data[straight_vars].nunique(axis=1) == 1]
+            for rid in data.loc[failed.index, "RespondentID"]:
+                results.append([rid, ",".join(straight_vars), "Straightliner", "All answers identical", "Fail"])
 
-                # ---- JUNK OE CHECK ----
-                elif check == "junk-oe":
-                    pattern = r"[^a-zA-Z\s]"
-                    failed = data[data[var].astype(str).str.contains(pattern, regex=True)]
-                    for rid in failed["RespondentID"]:
-                        results.append([rid, var, "Junk OE", "Contains junk text", "Fail"])
+        # Junk OE
+        elif check == "junk-oe":
+            failed = data[data[var].astype(str).str.contains(r"^[^a-zA-Z0-9]+$", na=False)]
+            for rid in failed["RespondentID"]:
+                results.append([rid, var, "Junk-OE", "Gibberish open-end", "Fail"])
 
-                # ---- AI GENERATED OE CHECK ----
-                elif check == "ai-oe":
-                    failed = data[data[var].astype(str).str.contains("As an AI", case=False, na=False)]
-                    for rid in failed["RespondentID"]:
-                        results.append([rid, var, "AI OE", "Likely AI-generated response", "Fail"])
+        # AI OE
+        elif check == "ai-oe":
+            ai_patterns = ["as an ai", "language model", "cannot provide"]
+            failed = data[data[var].astype(str).str.lower().str.contains("|".join(ai_patterns), na=False)]
+            for rid in failed["RespondentID"]:
+                results.append([rid, var, "AI-OE", "Possible AI-generated response", "Fail"])
 
-                # ---- DUPLICATE RESPONDENT CHECK ----
-                elif check == "duplicate":
-                    duplicates = data[data.duplicated("RespondentID", keep=False)]
-                    for rid in duplicates["RespondentID"]:
-                        results.append([rid, "RespondentID", "Duplicate", "Duplicate RespondentID", "Fail"])
+        # Duplicate RespondentID
+        elif check == "duplicate":
+            dupes = data[data.duplicated("RespondentID", keep=False)]
+            for rid in dupes["RespondentID"]:
+                results.append([rid, "RespondentID", "Duplicate", "Duplicate RespondentID", "Fail"])
 
-        # Build report
-        report_df = pd.DataFrame(results, columns=["RespondentID", "Variable", "CheckType", "Condition", "Issue"])
-        st.dataframe(report_df)
+    # --- Build final report ---
+    report_df = pd.DataFrame(results, columns=["RespondentID", "Variable", "CheckType", "Condition", "Issue"])
 
-        # Download option
-        st.download_button("Download Validation Report", report_df.to_excel(index=False), "validation_report.xlsx")
+    st.subheader("Validation Results")
+    st.dataframe(report_df)
+
+    # --- Download button (FIXED) ---
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        report_df.to_excel(writer, index=False, sheet_name="Validation Report")
+    output.seek(0)
+
+    st.download_button(
+        label="Download Validation Report",
+        data=output,
+        file_name="validation_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
