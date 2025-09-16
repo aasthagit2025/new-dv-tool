@@ -158,9 +158,8 @@ if data_file and rules_file:
                         "Value": ", ".join([str(df.at[idx, c]) for c in related_cols])
                     })
 
-        # --- Straightliner: related columns start with q (prefix) ---
+       # --- Straightliner: related_cols is explicit list or prefix-based list ---
         elif check_type == "Straightliner":
-            related_cols = [col for col in df.columns if col.startswith(q)]
             if len(related_cols) > 1:
                 for idx in df.index:
                     vals = df.loc[idx, related_cols].dropna().astype(str).str.strip().tolist()
@@ -172,6 +171,15 @@ if data_file and rules_file:
                             "Issue": "All responses identical across the block",
                             "Value": vals[0] if vals else ""
                         })
+            else:
+                # if only one column found, no straightliner test possible; report as info
+                rows.append({
+                    "RespondentID": "",
+                    "Question": q,
+                    "Check_Type": "Straightliner",
+                    "Issue": "Straightliner rule expects multiple related columns but only one or none found",
+                    "Value": ", ".join(related_cols)
+                })
 
         # --- OpenEnd_Junk: short / gibberish (simple heuristic) ---
         elif check_type == "OpenEnd_Junk":
