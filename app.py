@@ -158,28 +158,30 @@ if data_file and rules_file:
                         "Value": ", ".join([str(df.at[idx, c]) for c in related_cols])
                     })
 
-       # --- Straightliner: related_cols is explicit list or prefix-based list ---
-        elif check_type == "Straightliner":
-            if len(related_cols) > 1:
-                for idx in df.index:
-                    vals = df.loc[idx, related_cols].dropna().astype(str).str.strip().tolist()
-                    if len(vals) > 1 and len(set(vals)) == 1:
-                        rows.append({
-                            "RespondentID": df.at[idx, "RespondentID"],
-                            "Question": ",".join(related_cols),
-                            "Check_Type": "Straightliner",
-                            "Issue": "All responses identical across the block",
-                            "Value": vals[0] if vals else ""
-                        })
-            else:
-                # if only one column found, no straightliner test possible; report as info
-                rows.append({
-                    "RespondentID": "",
-                    "Question": q,
-                    "Check_Type": "Straightliner",
-                    "Issue": "Straightliner rule expects multiple related columns but only one or none found",
-                    "Value": ", ".join(related_cols)
-                })
+       elif check_type == "Straightliner":
+    # Support multiple columns listed as comma-separated in rules
+    related_cols = [col.strip() for col in q.split(",")]
+
+    # Only keep the columns that actually exist in the dataset
+    related_cols = [col for col in related_cols if col in df.columns]
+
+    if len(related_cols) > 1:
+        straightliners = df[related_cols].nunique(axis=1)
+        offenders = df.loc[straightliners == 1, "RespondentID"]
+        for rid in offenders:
+            report.append({
+                "RespondentID": rid,
+                "Question": ",".join(related_cols),
+                "Check_Type": "Straightliner",
+                "Issue": "Same response across all items"
+            })
+    else:
+        report.append({
+            "RespondentID": None,
+            "Question": q,
+            "Check_Type": "Straightliner",
+            "Issue": "Question(s) not found in dataset"
+        })
 
         # --- OpenEnd_Junk: short / gibberish (simple heuristic) ---
         elif check_type == "OpenEnd_Junk":
